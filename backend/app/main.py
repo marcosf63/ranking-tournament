@@ -41,6 +41,17 @@ app.add_middleware(
 
 app.add_middleware(SessionMiddleware, secret_key=settings.secret_key)
 
+# Include API routes
+try:
+    from .api.v1 import api_router
+except ImportError:
+    import sys
+    import os
+    sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+    from app.api.v1 import api_router
+    
+app.include_router(api_router, prefix="/api")
+
 @app.get("/")
 async def root():
     logger.info("Root endpoint accessed")
