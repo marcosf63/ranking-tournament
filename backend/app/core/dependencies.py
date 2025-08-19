@@ -1,8 +1,9 @@
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from sqlmodel import Session, select
+from sqlmodel import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional
-from .database import get_session
+from .database import get_async_session
 from .security import verify_token
 from ..models.admin import Admin
 import logging
@@ -11,9 +12,9 @@ logger = logging.getLogger(__name__)
 
 security = HTTPBearer()
 
-def get_current_admin(
+async def get_current_admin(
     credentials: HTTPAuthorizationCredentials = Depends(security),
-    session: Session = Depends(get_session)
+    session: AsyncSession = Depends(get_async_session)
 ) -> Admin:
     """Dependência para obter o admin atual autenticado"""
     
@@ -29,6 +30,12 @@ def get_current_admin(
     if payload is None:
         logger.warning("Invalid token provided")
         raise credentials_exception
+
+    # Check if token is blacklisted
+    jti = payload.get("jti")
+    if not jti or await cache_service.is_in_blacklist(jti):
+        logger.warning(f"Blacklisted token used for admin_id: {payload.get('admin_id')}")
+        raise credentials_exception
         
     admin_id = payload.get("admin_id")
     if admin_id is None:
@@ -36,7 +43,8 @@ def get_current_admin(
         raise credentials_exception
     
     # Buscar admin no banco
-    admin = session.query(Admin).filter(Admin.id == admin_id, Admin.is_active == True).first()
+    result = await session.exec(select(Admin).where(Admin.id == admin_id, Admin.is_active == True))
+    admin = result.first()
     
     if admin is None:
         logger.warning(f"Admin not found or inactive: {admin_id}")
@@ -44,7 +52,7 @@ def get_current_admin(
         
     return admin
 
-def get_current_active_admin(
+async def get_current_active_admin(
     current_admin: Admin = Depends(get_current_admin)
 ) -> Admin:
     """Dependência para garantir que o admin está ativo"""
@@ -55,7 +63,7 @@ def get_current_active_admin(
         )
     return current_admin
 
-def require_admin_level(
+async def require_admin_level(
     current_admin: Admin = Depends(get_current_active_admin)
 ) -> Admin:
     """Dependência para garantir nível admin (não moderator)"""
@@ -66,25 +74,29 @@ def require_admin_level(
         )
     return current_admin
 
-def get_optional_current_admin(
+async def get_optional_current_admin(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
-    session: Session = Depends(get_session)
+    session: AsyncSession = Depends(get_async_session)
 ) -> Optional[Admin]:
     """Dependência para obter admin atual (opcional)"""
     if not credentials:
         return None
         
-    token = credentials.credentials
-    payload = verify_token(token, "access")
-    
-    if payload is None:
-        return None
+    try:
+        token = credentials.credentials
+        payload = verify_token(token, "access")
         
-    admin_id = payload.get("admin_id")
-    if admin_id is None:
+        if payload is None:
+            return None
+            
+        admin_id = payload.get("admin_id")
+        if admin_id is None:
+            return None
+        
+        # Buscar admin no banco
+        result = await session.exec(select(Admin).where(Admin.id == admin_id, Admin.is_active == True))
+        admin = result.first()
+        
+        return admin
+    except Exception:
         return None
-    
-    # Buscar admin no banco
-    admin = session.query(Admin).filter(Admin.id == admin_id, Admin.is_active == True).first()
-    
-    return admin

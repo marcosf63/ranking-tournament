@@ -18,7 +18,11 @@ def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta]
     else:
         expire = datetime.utcnow() + timedelta(minutes=settings.access_token_expire_minutes)
     
-    to_encode.update({"exp": expire, "type": "access"})
+    to_encode.update({
+        "exp": expire, 
+        "type": "access",
+        "jti": str(uuid.uuid4())
+    })
     encoded_jwt = jwt.encode(to_encode, settings.secret_key, algorithm=settings.jwt_algorithm)
     return encoded_jwt
 
@@ -39,9 +43,9 @@ def verify_token(token: str, token_type: str = "access") -> Optional[Dict[str, A
         if payload.get("type") != token_type:
             return None
             
-        # Verificar expiração
+        # Verificar expiraï¿½ï¿½o
         exp = payload.get("exp")
-        if exp is None or datetime.fromtimestamp(exp) < datetime.utcnow():
+        if exp is None or datetime.utcfromtimestamp(exp) < datetime.utcnow():
             return None
             
         return payload

@@ -1,43 +1,38 @@
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlmodel import Session, select
+from fastapi import APIRouter, Depends, HTTPException, status, Request
+from sqlmodel import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime
-from typing import Dict, Any
 import logging
 
-from ...core.database import get_session
-from ...core.security import verify_password, create_token_response, verify_token
-from ...models.admin import Admin
-from ...schemas.auth import LoginRequest, LoginResponse, TokenResponse, RefreshTokenRequest, AdminResponse
+from ....core.database import get_async_session
+from ....core.security import verify_password, create_token_response, verify_token
+from ....models.admin import Admin
+from ....schemas.auth import LoginRequest, LoginResponse, TokenResponse, RefreshTokenRequest, AdminResponse
+from ....services.audit_service import audit_service
+from ....core.cache import cache_service
+from ....core.dependencies import security
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 logger = logging.getLogger(__name__)
 
 @router.post("/login", response_model=LoginResponse)
 async def login(
+    request: Request,
     login_data: LoginRequest,
-    session: Session = Depends(get_session)
+    session: AsyncSession = Depends(get_async_session)
 ):
     """Autenticar admin e retornar tokens JWT"""
     
-    # Buscar admin por email
-    admin = session.query(Admin).filter(Admin.email == login_data.email).first()
+    result = await session.exec(select(Admin).where(Admin.email == login_data.email))
+    admin = result.first()
     
-    if not admin:
-        logger.warning(f"Login attempt with invalid email: {login_data.email}")
+    if not admin or not verify_password(login_data.password, admin.password_hash):
+        logger.warning(f"Login attempt with invalid credentials for email: {login_data.email}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials"
         )
     
-    # Verificar senha
-    if not verify_password(login_data.password, admin.password_hash):
-        logger.warning(f"Invalid password for admin: {admin.email}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials"
-        )
-    
-    # Verificar se admin está ativo
     if not admin.is_active:
         logger.warning(f"Login attempt by inactive admin: {admin.email}")
         raise HTTPException(
@@ -45,35 +40,33 @@ async def login(
             detail="Account is inactive"
         )
     
-    # Atualizar último login
     admin.last_login = datetime.utcnow()
     session.add(admin)
-    session.commit()
-    session.refresh(admin)
+    await session.commit()
+    await session.refresh(admin)
     
-    # Criar tokens
     admin_data = {"id": admin.id, "email": admin.email, "permission_level": admin.permission_level}
     tokens = create_token_response(admin_data)
     
     logger.info(f"Successful login for admin: {admin.email}")
+
+    await audit_service.log_action(
+        session=session, action="LOGIN", table_name="admins",
+        record_id=admin.id, admin_id=admin.id,
+        new_values={"ip_address": request.client.host}
+    )
     
     return LoginResponse(
-        admin=AdminResponse(
-            id=admin.id,
-            name=admin.name,
-            email=admin.email,
-            permission_level=admin.permission_level,
-            is_active=admin.is_active,
-            last_login=admin.last_login.isoformat() if admin.last_login else None,
-            created_at=admin.created_at.isoformat()
-        ),
+        admin=AdminResponse.model_validate(admin),
         tokens=TokenResponse(**tokens)
     )
+
+from fastapi.security import HTTPAuthorizationCredentials
 
 @router.post("/refresh", response_model=TokenResponse)
 async def refresh_token(
     refresh_data: RefreshTokenRequest,
-    session: Session = Depends(get_session)
+    session: AsyncSession = Depends(get_async_session)
 ):
     """Renovar access token usando refresh token"""
     
@@ -96,7 +89,8 @@ async def refresh_token(
         )
     
     # Buscar admin
-    admin = session.query(Admin).filter(Admin.id == admin_id, Admin.is_active == True).first()
+    result = await session.exec(select(Admin).where(Admin.id == admin_id, Admin.is_active == True))
+    admin = result.first()
     
     if admin is None:
         logger.warning(f"Admin not found or inactive for refresh: {admin_id}")
@@ -113,12 +107,22 @@ async def refresh_token(
     
     return TokenResponse(**tokens)
 
-@router.post("/logout")
-async def logout():
-    """Logout do admin (invalidar tokens - implementação futura)"""
-    # Para uma implementação completa, seria necessário uma blacklist de tokens
-    # Por enquanto, apenas retorna sucesso (tokens expiram naturalmente)
+@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+async def logout(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+):
+    """Invalida o access token atual adicionando-o à blacklist."""
+    token = credentials.credentials
+    payload = verify_token(token, "access")
+
+    if payload:
+        jti = payload.get("jti")
+        exp = payload.get("exp")
+        if jti and exp:
+            # Calcula o tempo restante de vida do token em segundos
+            ttl = round(datetime.fromtimestamp(exp).timestamp() - datetime.utcnow().timestamp())
+            if ttl > 0:
+                await cache_service.add_to_blacklist(jti, ttl)
+                logger.info(f"Token {jti} blacklisted.")
     
-    logger.info("Admin logout")
-    
-    return {"message": "Logout successful"}
+    return

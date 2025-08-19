@@ -42,7 +42,7 @@ async def get_async_session() -> AsyncSession:
             await session.close()
 
 def get_session() -> Session:
-    with SessionLocal() as session:
+    with Session(sync_engine) as session:
         try:
             yield session
         except Exception as e:
